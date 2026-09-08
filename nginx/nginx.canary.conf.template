@@ -1,0 +1,13 @@
+upstream app_upstream {
+    server api-__STABLE_COLOR__:8000 weight=__STABLE_WEIGHT__;
+    server api-__CANARY_COLOR__:8000 weight=__CANARY_WEIGHT__;
+}
+
+server {
+    listen 80;
+
+    location / {
+        proxy_pass http://app_upstream;
+        proxy_set_header Host $host;
+    }
+}
