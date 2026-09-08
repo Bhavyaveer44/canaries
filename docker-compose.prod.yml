@@ -1,0 +1,100 @@
+services:
+  # Stateful services are NOT blue-greened. Running two live Postgres
+  # instances would mean two copies of your data diverging the moment
+  # both are writable - that's a data-consistency problem, not a
+  # deployment problem, and it's the single most common mistake people
+  # make explaining blue-green in interviews. Only the stateless app
+  # tier (api, worker) gets duplicated.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: jobsdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # nginx is the one component that decides who's "live". It has no
+  # profile, so it's always running - flipping traffic is just
+  # changing which conf file is mounted and reloading it, never
+  # restarting the container.
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx/active.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/logging.conf:/etc/nginx/conf.d/00-logging.conf:ro
+      - nginx_logs:/var/log/nginx
+
+  api-blue:
+    profiles: ["blue"]
+    image: ${IMAGE_NAMESPACE}/api:${BLUE_TAG}
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      APP_VERSION: ${BLUE_TAG}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker-blue:
+    profiles: ["blue"]
+    image: ${IMAGE_NAMESPACE}/worker:${BLUE_TAG}
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/jobsdb"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  api-green:
+    profiles: ["green"]
+    image: ${IMAGE_NAMESPACE}/api:${GREEN_TAG}
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      APP_VERSION: ${GREEN_TAG}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker-green:
+    profiles: ["green"]
+    image: ${IMAGE_NAMESPACE}/worker:${GREEN_TAG}
+    restart: unless-stopped
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/jobsdb"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  nginx_logs:

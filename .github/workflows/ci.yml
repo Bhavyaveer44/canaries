@@ -1,0 +1,235 @@
+name: CI
+
+# Triggers: run on every push to main (so we always know main is
+# healthy) and on every pull request targeting main (so we catch
+# breakage before merge, not after).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Letting a human pick the strategy at trigger time (rather than
+  # hardcoding it) is what makes this one pipeline able to demonstrate
+  # both approaches. In a real org you'd normally hardcode ONE
+  # strategy per service based on its risk profile, not choose per
+  # deploy - a payments service might always use canary; an internal
+  # admin tool might always use blue-green.
+  workflow_dispatch:
+    inputs:
+      deploy_strategy:
+        description: "Production deploy strategy"
+        type: choice
+        options: [blue-green, canary]
+        default: blue-green
+
+# GITHUB_TOKEN is auto-generated per workflow run by GitHub - no
+# secret to create yourself. By default it's read-only; we need
+# write access to push images to GitHub Container Registry (GHCR).
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository }}
+
+jobs:
+  test:
+    name: test (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Matrix: run this identical set of steps once per value in
+      # `service`, in parallel, instead of copy-pasting the job
+      # twice. Add a third microservice later and it's one line here.
+      matrix:
+        service: [api, worker]
+      # If api's tests fail, we still want to know whether worker's
+      # tests pass or fail in the same run, rather than the whole
+      # matrix aborting on the first failure.
+      fail-fast: false
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # Caches pip's downloaded packages between runs, keyed on
+          # the requirements file's hash - if dependencies haven't
+          # changed, install is near-instant instead of re-downloading
+          # every package on every push.
+          cache: "pip"
+          cache-dependency-path: services/${{ matrix.service }}/requirements*.txt
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        working-directory: services/${{ matrix.service }}
+        run: |
+          python -m pytest -v
+
+  build-and-push:
+    name: build-and-push (${{ matrix.service }})
+    needs: test
+    # Only build+push on an actual merge to main - a PR from a fork
+    # shouldn't be able to publish images, and we don't want to spam
+    # the registry with an image for every WIP PR commit.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api, worker]
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.service }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache backend for Docker layers: the next
+          # run reuses unchanged layers (e.g. the pip install layer,
+          # if requirements.txt didn't change) instead of rebuilding
+          # from scratch every time.
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  deploy-staging:
+    name: deploy to staging
+    needs: build-and-push
+    # `needs: build-and-push` on a matrix job waits for EVERY leg of
+    # that matrix (api and worker) to finish - we never deploy with
+    # only one of the two images freshly built.
+    runs-on: ubuntu-latest
+    # A GitHub "Environment" - beyond just a label, this gives you a
+    # deployment history tab in the repo UI, and is where protection
+    # rules (required reviewers, wait timers) get attached. Staging
+    # has none configured; prod will, in the next step.
+    environment:
+      name: staging
+      url: http://${{ secrets.STAGING_HOST }}:8000
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/
+
+            # Write the exact artifact CI just built as the target to
+            # pull. sha-<full commit sha> matches docker/metadata-action's
+            # type=sha,format=long tagging scheme from the build job.
+            cat > .env <<EOF
+            IMAGE_NAMESPACE=ghcr.io/${{ github.repository }}
+            IMAGE_TAG=sha-${{ github.sha }}
+            EOF
+
+            docker compose -f docker-compose.staging.yml pull
+            docker compose -f docker-compose.staging.yml up -d --remove-orphans
+
+      - name: Smoke test staging
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            # Give the container a few seconds past its Docker
+            # healthcheck before we hit it over HTTP.
+            for i in $(seq 1 10); do
+              if curl -sf http://localhost:8000/health | grep -q '"status":"ok"'; then
+                echo "staging is healthy"
+                exit 0
+              fi
+              echo "waiting for staging api to become healthy... ($i/10)"
+              sleep 3
+            done
+            echo "staging smoke test FAILED"
+            exit 1
+
+  deploy-production:
+    name: deploy to production (blue-green)
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    # This is the actual gate we designed the whole pipeline around
+    # back in Step 1: Continuous DELIVERY, not Continuous Deployment.
+    # The "production" environment in this repo's Settings has a
+    # required-reviewer protection rule attached - the job pauses
+    # here and waits in GitHub's UI until someone with access clicks
+    # "Approve" before a single line below runs. Nothing about that
+    # rule lives in this YAML file; it's configured once in
+    # Settings -> Environments -> production -> Required reviewers.
+    environment:
+      name: production
+      url: http://${{ secrets.PROD_HOST }}:8000
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Copy deploy files to prod server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          source: >-
+            docker-compose.prod.yml,
+            nginx/nginx.blue.conf,nginx/nginx.green.conf,
+            nginx/nginx.canary.conf.template,nginx/logging.conf,
+            scripts/deploy-blue-green.sh,scripts/deploy-canary.sh
+          target: "/opt/cicd-microservices-demo"
+          strip_components: 0
+
+      - name: Run production deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/cicd-microservices-demo
+            chmod +x scripts/deploy-blue-green.sh scripts/deploy-canary.sh
+            export IMAGE_NAMESPACE=ghcr.io/${{ github.repository }}
+            export NEW_TAG=sha-${{ github.sha }}
+
+            STRATEGY="${{ github.event.inputs.deploy_strategy || 'blue-green' }}"
+            echo "Deploy strategy: $STRATEGY"
+            if [ "$STRATEGY" = "canary" ]; then
+              bash scripts/deploy-canary.sh
+            else
+              bash scripts/deploy-blue-green.sh
+            fi
