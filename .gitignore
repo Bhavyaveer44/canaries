@@ -4,3 +4,4 @@ __pycache__/
 .env
 nginx/active.conf
 deploy-state.env
+.venv/
